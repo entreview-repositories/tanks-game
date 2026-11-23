@@ -1,0 +1,83 @@
+name: capstone-clone-prog6
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: battletanks_clone
+      POSTGRES_USER: capstone
+      POSTGRES_PASSWORD: capstone_local
+    ports: ["127.0.0.1:5434:5432"]
+    volumes: [postgres_data:/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U capstone -d battletanks_clone"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+  redis:
+    image: redis:7-alpine
+    ports: ["127.0.0.1:6381:6379"]
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+  # ---- Infraestructura de juego ----
+  emqx:
+    image: emqx:5.8
+    container_name: battletanks-emqx
+    ports:
+      - "1883:1883"    # MQTT TCP
+      - "8083:8083"    # MQTT WebSocket (for Angular)
+      - "18083:18083"  # EMQX Dashboard (admin/public)
+    environment:
+      - EMQX_ALLOW_ANONYMOUS=true
+    volumes:
+      - emqx_data:/opt/emqx/data
+    restart: unless-stopped
+
+  # ---- Benchmarking & Observabilidad (Lab 08) ----
+  influxdb:
+    profiles: [observability]
+    image: influxdb:2.7
+    container_name: battletanks-influxdb
+    ports:
+      - "8086:8086"    # InfluxDB HTTP API & UI
+    env_file:
+      - lab08/influxdb/config.env
+    volumes:
+      - influxdb_data:/var/lib/influxdb2
+      - influxdb_config:/etc/influxdb2
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  grafana:
+    profiles: [observability]
+    image: grafana/grafana:10.4.0
+    container_name: battletanks-grafana
+    ports:
+      - "127.0.0.1:3010:3000"    # Grafana UI (admin/admin por defecto)
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=battletanks_grafana_2024
+      - GF_USERS_ALLOW_SIGN_UP=false
+      # Provisioning automático del datasource InfluxDB
+      - GF_DATASOURCES_DEFAULT_TYPE=influxdb
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./lab08/grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  emqx_data:
+  influxdb_data:
+  influxdb_config:
+  grafana_data:

@@ -1,0 +1,372 @@
+using System.Collections.Concurrent;
+using Microsoft.AspNetCore.Authorization;
+using System.Security.Claims;
+using Microsoft.AspNetCore.SignalR;
+using StackExchange.Redis;
+using BattleTanks_Backend.Data;
+using BattleTanks_Backend.Models;
+using BattleTanks_Backend.Services;
+
+namespace BattleTanks_Backend.Hubs;
+
+public record PlayerConnection(string PlayerName, string RoomId, double X = 0, double Y = 0);
+
+[Authorize]
+public class GameHub : Hub
+{
+    private static readonly ConcurrentDictionary<string, PlayerConnection> ConnectedPlayers = new();
+    private static readonly ConcurrentDictionary<string, bool> SubmittedScores = new();
+    private static readonly Random _random = new();
+
+    private readonly RoomMembership _members;
+    private string AccountId => Context.User!.FindFirstValue(ClaimTypes.NameIdentifier)!;
+    private readonly PlayerService _playerService;
+    private readonly IMqttGameService _mqtt;
+    private readonly IRedisHistoryService _history;
+    private readonly IDatabase _redis;
+    private readonly BattleTanksDbContext _context;
+
+    public GameHub(PlayerService playerService, IMqttGameService mqtt, IRedisHistoryService history, IConnectionMultiplexer redis, BattleTanksDbContext context, RoomMembership members)
+    {
+        _playerService = playerService;
+        _mqtt = mqtt;
+        _history = history;
+        _redis = redis.GetDatabase();
+        _context = context;
+        _members = members;
+    }
+
+    public async Task JoinGame(string playerId, string playerName, string roomId, double x = 0, double y = 0)
+    {
+        playerName = Context.User!.Identity!.Name!;
+        if (!string.IsNullOrEmpty(roomId) && (!int.TryParse(roomId, out var room) || !_members.Contains(room, AccountId))) throw new HubException("Join the room first");
+        if (ConnectedPlayers.ContainsKey(Context.ConnectionId)) await LeaveRoom();
+        ConnectedPlayers[Context.ConnectionId] = new PlayerConnection(playerName, roomId, x, y);
+
+        if (string.IsNullOrEmpty(roomId))
+        {
+            await Groups.AddToGroupAsync(Context.ConnectionId, "lobby");
+            Console.WriteLine($"[GameHub] Player registered in lobby: {playerName}");
+            return;
+        }
+
+        await JoinRoomGroup(roomId);
+    }
+
+    private async Task JoinRoomGroup(string roomId)
+    {
+        var conn = ConnectedPlayers[Context.ConnectionId];
+        var groupName = $"room-{roomId}";
+
+        await Groups.AddToGroupAsync(Context.ConnectionId, groupName);
+
+        var existingPlayers = ConnectedPlayers
+            .Where(kvp => kvp.Key != Context.ConnectionId && kvp.Value.RoomId == roomId)
+            .Select(kvp => new { playerId = kvp.Key, playerName = kvp.Value.PlayerName, x = kvp.Value.X, y = kvp.Value.Y })
+            .ToList();
+
+        await Clients.Caller.SendAsync("ExistingPlayers", existingPlayers);
+        await Clients.OthersInGroup(groupName).SendAsync("PlayerJoined", Context.ConnectionId, conn.PlayerName, conn.X, conn.Y);
+
+        Console.WriteLine($"[GameHub] Player joined room {roomId}: {conn.PlayerName}");
+
+        var history = await _history.GetRoomHistoryAsync(roomId, 20);
+        if (history.Any())
+            await Clients.Caller.SendAsync("RoomHistory", history);
+
+        try
+        {
+            await _redis.HashSetAsync($"room:{roomId}:players", Context.ConnectionId, conn.PlayerName);
+            await _redis.StringIncrementAsync($"room:{roomId}:count");
+        }
+        catch { }
+    }
+
+    public async Task SendPlayerMove(string playerId, object movement)
+    {
+        var conn = ConnectedPlayers.GetValueOrDefault(Context.ConnectionId);
+        if (conn == null) return;
+
+        if (movement is System.Text.Json.JsonElement json && json.TryGetProperty("position", out var pos))
+        {
+            var newX = pos.GetProperty("x").GetDouble();
+            var newY = pos.GetProperty("y").GetDouble();
+            ConnectedPlayers[Context.ConnectionId] = conn with { X = newX, Y = newY };
+        }
+
+        var groupName = $"room-{conn.RoomId}";
+        await Clients.OthersInGroup(groupName).SendAsync("ReceivePlayerMove", Context.ConnectionId, movement);
+    }
+
+    public async Task StartGame(string mapName)
+    {
+        var conn = ConnectedPlayers.GetValueOrDefault(Context.ConnectionId);
+        if (conn == null) return;
+        if (!int.TryParse(conn.RoomId, out var ownedRoom) || !_members.IsOwner(ownedRoom, AccountId)) throw new HubException("Only the room creator can start");
+
+        var groupName = $"room-{conn.RoomId}";
+        Console.WriteLine($"[GameHub] Game started in room {conn.RoomId} with map: {mapName}");
+        await Clients.Group(groupName).SendAsync("GameStarted", mapName);
+
+        if (int.TryParse(conn.RoomId, out var sessionId))
+        {
+            var session = await _context.GameSessions.FindAsync(sessionId);
+            if (session != null)
+            {
+                session.Status = SessionStatus.InProgress;
+                await _context.SaveChangesAsync();
+            }
+        }
+
+        var initialPowerUps = BuildInitialPowerUps(conn.RoomId);
+        await Clients.Group(groupName).SendAsync("InitialPowerUps", initialPowerUps);
+
+        foreach (var pu in initialPowerUps)
+            await _history.SaveEventAsync(conn.RoomId, "powerup_spawned", pu);
+    }
+
+    private static List<PowerUpEvent> BuildInitialPowerUps(string roomId)
+    {
+        var types = new[] { "ammo", "health", "speed" };
+        var positions = new (double x, double y)[] { (80, 80), (280, 80), (160, 200) };
+        var result = new List<PowerUpEvent>();
+        for (int i = 0; i < positions.Length; i++)
+        {
+            result.Add(new PowerUpEvent(
+                Id: $"pu-initial-{i}",
+                Type: types[i],
+                X: positions[i].x,
+                Y: positions[i].y,
+                RoomId: roomId,
+                Timestamp: DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
+        }
+        return result;
+    }
+
+    public async Task SendChatMessage(string sender, string message)
+    {
+        var conn = ConnectedPlayers.GetValueOrDefault(Context.ConnectionId);
+        if (conn == null) return;
+
+        if (string.IsNullOrEmpty(conn.RoomId))
+        {
+            await Clients.Group("lobby").SendAsync("ReceiveChatMessage", sender, message);
+            return;
+        }
+
+        sender = conn.PlayerName;
+        if (string.IsNullOrWhiteSpace(message) || message.Length > 500) throw new HubException("Message must have 1–500 characters");
+        var groupName = $"room-{conn.RoomId}";
+        await Clients.Group(groupName).SendAsync("ReceiveChatMessage", sender, message);
+
+        await _mqtt.PublishChatAsync(conn.RoomId, sender, message);
+        await _history.SaveEventAsync(conn.RoomId, "chat", new { sender, message });
+    }
+
+    public async Task LeaveRoom()
+    {
+        if (!ConnectedPlayers.TryGetValue(Context.ConnectionId, out var conn)) return;
+        if (string.IsNullOrEmpty(conn.RoomId)) return;
+
+        var groupName = $"room-{conn.RoomId}";
+        await Groups.RemoveFromGroupAsync(Context.ConnectionId, groupName);
+        await Clients.OthersInGroup(groupName).SendAsync("PlayerLeft", Context.ConnectionId);
+        Console.WriteLine($"[GameHub] Player left room {conn.RoomId}: {conn.PlayerName}");
+
+        // Keep player registered but reset room so SetRoom/StartGame keep working
+        ConnectedPlayers[Context.ConnectionId] = conn with { RoomId = "" };
+        await DecrementPlayerCount(conn.RoomId);
+        await Groups.AddToGroupAsync(Context.ConnectionId, "lobby");
+
+        try
+        {
+            await _redis.HashDeleteAsync($"room:{conn.RoomId}:players", Context.ConnectionId);
+            await _redis.StringDecrementAsync($"room:{conn.RoomId}:count");
+        }
+        catch { }
+    }
+
+    public async Task SetRoom(string roomId)
+    {
+        if (!int.TryParse(roomId, out var id) || !_members.Contains(id, AccountId)) throw new HubException("Join the room first");
+        if (!ConnectedPlayers.TryGetValue(Context.ConnectionId, out var conn)) return;
+
+        var oldGroup = string.IsNullOrEmpty(conn.RoomId) ? null : $"room-{conn.RoomId}";
+        var newGroup = $"room-{roomId}";
+
+        // Leave lobby group when joining a room
+        await Groups.RemoveFromGroupAsync(Context.ConnectionId, "lobby");
+
+        if (oldGroup != null && oldGroup != newGroup)
+            await Groups.RemoveFromGroupAsync(Context.ConnectionId, oldGroup);
+
+        ConnectedPlayers[Context.ConnectionId] = conn with { RoomId = roomId };
+
+        await JoinRoomGroup(roomId);
+
+        if (int.TryParse(roomId, out var sessionId))
+        {
+            var session = await _context.GameSessions.FindAsync(sessionId);
+            if (session?.Status == SessionStatus.InProgress)
+            {
+                Console.WriteLine($"[GameHub] Late join: sending GameStarted to {conn.PlayerName} in room {roomId}");
+                await Clients.Caller.SendAsync("GameStarted", session.MapName);
+                var powerUps = BuildInitialPowerUps(roomId);
+                await Clients.Caller.SendAsync("InitialPowerUps", powerUps);
+            }
+        }
+    }
+
+    public async Task BulletFired(string playerId, double x, double y, string direction)
+    {
+        var conn = ConnectedPlayers.GetValueOrDefault(Context.ConnectionId);
+        if (conn == null) return;
+
+        var groupName = $"room-{conn.RoomId}";
+        await Clients.OthersInGroup(groupName).SendAsync("BulletFired", Context.ConnectionId, x, y, direction);
+    }
+
+    public async Task TileDestroyed(int tileX, int tileY)
+    {
+        var conn = ConnectedPlayers.GetValueOrDefault(Context.ConnectionId);
+        if (conn == null) return;
+
+        var groupName = $"room-{conn.RoomId}";
+        await Clients.OthersInGroup(groupName).SendAsync("TileDestroyed", tileX, tileY);
+
+        if (_random.NextDouble() < 0.30)
+            await SpawnPowerUp(conn.RoomId, tileX * 40, tileY * 40);
+    }
+
+    public async Task PlayerDied(string victimId, string victimName, string killerId, string killerName)
+    {
+        var conn = ConnectedPlayers.GetValueOrDefault(Context.ConnectionId);
+        if (conn == null) return;
+
+        var groupName = $"room-{conn.RoomId}";
+        await Clients.Group(groupName).SendAsync("PlayerDied", victimId, victimName, killerId, killerName);
+        await _history.SaveEventAsync(conn.RoomId, "player_died", new { victimId, victimName, killerId, killerName });
+        Console.WriteLine($"[GameHub] {victimName} was killed by {killerName} in room {conn.RoomId}");
+    }
+
+    public async Task SubmitScore(string playerName, int points)
+    {
+        var own = ConnectedPlayers.GetValueOrDefault(Context.ConnectionId);
+        if (own == null || points < 0 || points > 10000) throw new HubException("Invalid result");
+        if (!SubmittedScores.TryAdd($"{own.RoomId}:{AccountId}", true)) return;
+        await _playerService.SaveGameResultAsync(own.PlayerName, points, isVictory: false);
+        Console.WriteLine($"[GameHub] Score submitted for {playerName}: {points} pts");
+    }
+
+    public async Task ReportCollision(string victimId, int damage)
+    {
+        var conn = ConnectedPlayers.GetValueOrDefault(Context.ConnectionId);
+        if (conn == null) return;
+
+        if (damage != 25 || !ConnectedPlayers.TryGetValue(victimId, out var victim) || victim.RoomId != conn.RoomId) throw new HubException("Invalid collision");
+        var collision = new CollisionEvent(
+            AttackerId: Context.ConnectionId,
+            VictimId: victimId,
+            RoomId: conn.RoomId,
+            Damage: damage,
+            Timestamp: DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+
+        await Clients.Client(victimId).SendAsync("PlayerHit", Context.ConnectionId, damage);
+
+        await _mqtt.PublishCollisionAsync(conn.RoomId, collision);
+        await _history.SaveEventAsync(conn.RoomId, "collision", collision);
+    }
+
+    public async Task CollectPowerUp(string powerUpId)
+    {
+        var conn = ConnectedPlayers.GetValueOrDefault(Context.ConnectionId);
+        if (conn == null) return;
+
+        await _mqtt.PublishPowerUpCollectedAsync(conn.RoomId, powerUpId, Context.ConnectionId);
+        await _history.SaveEventAsync(conn.RoomId, "powerup_collected",
+            new { powerUpId, collectorId = Context.ConnectionId, collectorName = conn.PlayerName });
+    }
+
+    private static readonly ConcurrentDictionary<string, bool> _endedRooms = new();
+
+    public async Task EndGame(string winnerId, string winnerName, int finalScore = 0)
+    {
+        var conn = ConnectedPlayers.GetValueOrDefault(Context.ConnectionId);
+        if (conn == null) return;
+
+        if (!ConnectedPlayers.TryGetValue(winnerId, out var winner) || winner.RoomId != conn.RoomId || finalScore < 0 || finalScore > 10000) throw new HubException("Invalid winner");
+        winnerName = winner.PlayerName;
+        // Idempotency: only the first call per room is processed
+        if (!_endedRooms.TryAdd(conn.RoomId, true)) return;
+
+        if (int.TryParse(conn.RoomId, out var sessionId))
+        {
+            var session = await _context.GameSessions.FindAsync(sessionId);
+            if (session != null)
+            {
+                session.Status = SessionStatus.Finished;
+                await _context.SaveChangesAsync();
+            }
+        }
+
+        var groupName = $"room-{conn.RoomId}";
+        await Clients.Group(groupName).SendAsync("GameOver", winnerId, winnerName);
+
+        await _mqtt.PublishGameEndAsync(conn.RoomId, winnerId, winnerName);
+        await _history.SaveEventAsync(conn.RoomId, "game_end", new { winnerId, winnerName, finalScore });
+
+        // Use server-side player name to avoid trusting client input
+        await _playerService.SaveGameResultAsync(winner.PlayerName, finalScore, isVictory: true);
+        Console.WriteLine($"[GameHub] Game over in room {conn.RoomId}. Winner: {conn.PlayerName} ({finalScore} pts)");
+    }
+
+    public override async Task OnConnectedAsync()
+    {
+        Console.WriteLine($"[GameHub] Client connected: {Context.ConnectionId}");
+        await Clients.Caller.SendAsync("ConnectionEstablished", Context.ConnectionId);
+        await base.OnConnectedAsync();
+    }
+
+    public override async Task OnDisconnectedAsync(Exception? exception)
+    {
+        if (ConnectedPlayers.TryRemove(Context.ConnectionId, out var conn))
+        {
+            var groupName = $"room-{conn.RoomId}";
+            await Clients.OthersInGroup(groupName).SendAsync("PlayerLeft", Context.ConnectionId);
+            Console.WriteLine($"[GameHub] Client disconnected from room {conn.RoomId}: {conn.PlayerName}");
+
+            await DecrementPlayerCount(conn.RoomId);
+        }
+        else
+        {
+            Console.WriteLine($"[GameHub] Client disconnected: {Context.ConnectionId}");
+        }
+
+        await base.OnDisconnectedAsync(exception);
+    }
+
+    private async Task SpawnPowerUp(string roomId, double x, double y,
+        string? type = null, string? id = null)
+    {
+        var types = new[] { "ammo", "health", "speed" };
+        var powerUp = new PowerUpEvent(
+            Id: id ?? $"pu-{Guid.NewGuid():N}",
+            Type: type ?? types[_random.Next(types.Length)],
+            X: x,
+            Y: y,
+            RoomId: roomId,
+            Timestamp: DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+
+        await _mqtt.PublishPowerUpSpawnedAsync(roomId, powerUp);
+        await _history.SaveEventAsync(roomId, "powerup_spawned", powerUp);
+    }
+
+    private async Task DecrementPlayerCount(string roomId)
+    {
+        if (!int.TryParse(roomId, out var sessionId)) return;
+        if (_members.Remove(sessionId, AccountId)) await _playerService.DecrementSessionAsync(sessionId);
+        // Clean up ended-room tracking when the room is fully empty
+        if (!ConnectedPlayers.Values.Any(p => p.RoomId == roomId))
+            _endedRooms.TryRemove(roomId, out _);
+    }
+}

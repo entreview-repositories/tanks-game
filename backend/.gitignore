@@ -1,0 +1,52 @@
+## .NET
+bin/
+obj/
+*.user
+*.userosscache
+*.suo
+*.cache
+*.dll
+*.pdb
+
+## IDE
+.vs/
+.vscode/
+*.swp
+*~
+
+## Build
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+
+## NuGet
+*.nupkg
+**/packages/*
+
+## Logs
+*.log
+
+## OS
+.DS_Store
+Thumbs.db
+
+## Secrets
+appsettings.Development.json
+*.pfx
+*.key
+
+# Archivos locales y generados
+.env
+.env.*
+!.env.example
+!.env.*.example
+.tools/
+*.bak
+node_modules/
+TestResults/
+coverage/
+*.coverage
+*.coveragexml
+appsettings.Local.json
+appsettings.*.local.json
